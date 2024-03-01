@@ -40,10 +40,8 @@ pub fn main(
         //journalctl -t snapclient
         loop {
             let (client, _) = listener.accept()?;
-            if let Err(e) = fwd(client, &playing, &snapclient_vol, &snapclient_vol_changed) {
-                println!("<3>snapcast error: {}", e);
-                break;
-            }
+            let _ = fwd(client, &playing, &snapclient_vol, &snapclient_vol_changed);
+            thread::sleep(Duration::from_secs(1));
             match snapclient.try_wait()? {
                 None => {
                     //still running
@@ -93,7 +91,15 @@ fn fwd(
 
     let mut buffer = [0u8; 1024 * 17];
     //forward client -> server
-    while let Ok(r) = c.read(&mut buffer) {
+    loop {
+        let r = match c.read(&mut buffer) {
+            Err(e) => {
+                println!("<3>c2s error: {}", e);
+                s.shutdown(Shutdown::Write)?;
+                return Err(e);
+            },
+            Ok(r) => r
+        };
         if r == 0 {
             println!("<5>c2s done");
             s.shutdown(Shutdown::Write)?;
@@ -105,7 +111,6 @@ fn fwd(
             return Err(e);
         }
     }
-    Ok(())
 }
 
 fn server_read(server: &mut TcpStream, buf: &mut [u8]) -> Result<(u16, usize), std::io::Error> {
@@ -150,8 +155,8 @@ fn server_to_client(
                 // ServerSettings
                 // 4b size + {"bufferMs":1000,"latency":0,"muted":false,"volume":100}
                 let json = &buf[26 + 4..size + 26];
-                let m = get_json_val(&buf, b"muted").is_some_and(|v| v == b"true");
-                let v = get_json_val(&buf, b"volume").map(|s| {
+                let m = get_json_val(json, b"muted").is_some_and(|v| v == b"true");
+                let v = get_json_val(json, b"volume").map(|s| {
                     let vol: u32 = s
                         .iter()
                         .rev()
@@ -173,13 +178,18 @@ fn server_to_client(
                         .unwrap()
                         .store(true, Ordering::Relaxed);
                 }
-
                 println!(
+                    "SC Volume m:{} v:{:?}",
+                    m,
+                    v
+                );
+                
+                /*println!(
                     "ServerSettings: {} m:{} v:{:?}",
                     std::str::from_utf8(json).unwrap(),
                     m,
                     v
-                );
+                );*/
             }
             2 => {
                 // Wire Chunk
