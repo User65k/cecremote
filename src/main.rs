@@ -1,6 +1,5 @@
 use cec_linux::{
-    CecDevice, CecLogAddrType, CecLogAddrs, CecLogicalAddress, CecModeFollower, CecModeInitiator,
-    CecOpcode, CecPrimDevType, Version, CEC_VENDOR_ID_NONE, CecPowerStatus
+    CecDevice, CecLogAddrType, CecLogAddrs, CecLogicalAddress, CecModeFollower, CecModeInitiator, CecOpcode, CecPowerStatus, CecPrimDevType, CecUserControlCode, Version, CEC_VENDOR_ID_NONE
 };
 use sispm::{get_devices, GlobalSiSPM};
 use std::convert::TryInto;
@@ -11,7 +10,7 @@ use std::convert::TryFrom;
 
 mod monitor;
 mod sock;
-mod snapclient;
+mod snapclient_mitm;
 
 use monitor::mon;
 use sock::{listen_for_vol_changes, setup_sock};
@@ -103,7 +102,10 @@ fn main() -> std::io::Result<()> {
     //let (pw_sender, pw_receiver) = pipewire::channel::channel();
     //thread::spawn(move || pulse::watch(shared1, pw_receiver).expect("pw"));
 
-    thread::spawn(move || snapclient::main(shared1).expect("pw err"));
+    let act = Arc::clone(&actor);
+    let snapclient_vol = Arc::new(Mutex::new(0u8));
+    let snapclient_volume = Arc::clone(&snapclient_vol);
+    thread::spawn(move || snapclient_mitm::main(shared1, act, snapclient_vol).expect("mitm err"));
 
     let cycle_time = time::Duration::from_millis(SLEEP_TIME_CYCLE_MS);
     let mut cycles_not_changed = 0;
@@ -116,7 +118,7 @@ fn main() -> std::io::Result<()> {
             avr_standby,
             cec_addr,
         } = *global_state.lock().unwrap();
-        let pulse = false; //pw_plays.load(Ordering::Relaxed);
+        let pulse = pw_plays.load(Ordering::Relaxed);
         
         state = match &state {
             MediaState::Watching if tv == Some(false) => {
@@ -134,11 +136,11 @@ fn main() -> std::io::Result<()> {
             MediaState::Playing if tv == Some(true) => {
                 println!("Playing: {tv:?} {pulse}");
                 // TV turned On
-                //TODO restore vol
                 let m = actor.lock().expect("main lock");
                 if let Some(from) = cec_addr {
                     cec_audio_mode_off(&m.cec, from);
                 }
+                //TODO restore vol
                 switch_light(&m.pwr_socket, true);
                 MediaState::Watching
             }
@@ -173,13 +175,15 @@ fn main() -> std::io::Result<()> {
                     switch_light(&m.pwr_socket, true);
                     MediaState::Watching
                 } else if pulse {
-                    //TODO store volume
                     let from = match cec_addr {
                         Some(a) => a,
                         None => continue,
                     };
                     cec_audio_mode(&m.cec, from);
                     let _ = request_pwr_state(&m.cec, from);
+                    // store volume
+                    let mut old_vol = 0;
+                    set_volume(&m.cec, *snapclient_volume.lock().unwrap(), Some(&mut old_vol));
                     MediaState::Playing
                 } else {
                     println!("<3>TV and Audio off. No need for AVR anymore");
@@ -198,12 +202,40 @@ fn main() -> std::io::Result<()> {
                     }
                 };
                 let m = actor.lock().expect("main lock");
+
+                let avr_pwr = request_pwr_state(&m.cec, from);
+                if avr_pwr.is_some() {
+                    global_state.lock().unwrap().avr_ready = true;
+                }
+
                 if tv == Some(true) {
+                    if let Some(CecPowerStatus::On) = avr_pwr {
+                        //all good
+                        println!("<4>But AVR is already on");
+                        continue;
+                    }
                     print_err(
                         m.cec.turn_on(from, CecLogicalAddress::Audiosystem),
                         "PwrOn audio",
                     );
                 } else if pulse {
+                    if let Some(CecPowerStatus::On) = avr_pwr {
+                        //all good
+                        if m.cec
+                            .request_data(
+                            from,
+                            CecLogicalAddress::Audiosystem,
+                            CecOpcode::GiveSystemAudioModeStatus,
+                            b"",
+                            CecOpcode::SystemAudioModeStatus,
+                            )
+                            .ok()
+                            .and_then(|data| data.first().copied())
+                            .is_some_and(|v|v==1) {
+                                println!("<4>But AVR is already in SystemAudioMode");
+                                continue;
+                            }
+                    }
                     cec_audio_mode(&m.cec, from);
                 }
                 MediaState::WaitForAudio
@@ -415,4 +447,36 @@ fn cec_audio_mode_off(cec: &CecDevice, from: CecLogicalAddress) {
         ),
         "SystemAudioModeRequest off",
     );
+}
+
+fn set_volume(cec: &CecDevice, vol: u8, cur: Option<&mut u8>) {
+    if let Some(v) = cec.request_data(
+        CecLogicalAddress::Playback2,
+        CecLogicalAddress::Audiosystem,
+        CecOpcode::GiveAudioStatus,
+        b"",
+        CecOpcode::ReportAudioStatus,
+    ).ok().and_then(|d|d.first().copied()) {
+        println!("Vol is: Muted: {} Vol: {}%", v & 0x80, v & 0x7f);
+        if let Some(c) = cur {
+            *c = v & 0x7f;
+        }
+        let steps = vol as i8 - (v & 0x7f) as i8;
+        let key = if steps.is_positive() {
+            CecUserControlCode::VolumeUp
+        } else {
+            CecUserControlCode::VolumeDown
+        };
+        let steps = steps.unsigned_abs() * 2;
+        for _ in 0..steps {
+            if let Err(e) = cec.keypress(
+                CecLogicalAddress::Playback2,
+                CecLogicalAddress::Audiosystem,
+                key,
+            ) {
+                println!("<3>keypress Err: {:?}", e);
+                return;
+            }
+        }
+    }
 }

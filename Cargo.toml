@@ -7,7 +7,6 @@ edition = "2021"
 cec_linux = {version="*", features=["poll"]}
 sispm = "*"
 ctrlc = "*"
-pipewire = "*"
 
 [profile.release]
 lto = "fat"

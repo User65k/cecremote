@@ -34,12 +34,14 @@ pub fn listen_for_vol_changes(listener: UnixListener, act: Arc<Mutex<Actor>>) {
             //0-100 Vol
             //&0x80 on/off
             //&0xC0 activesource
-            match buf[0] {
+            let n = buf[0];
+            match n {
                 1..=100 => {
-                    set_volume(&act, buf[0]);
+                    set_volume(&act, n);
                 }
                 0 => println!("mute"),
-                n => match n & 0xF8 {
+                101..=127 => println!("?"),
+                0x80..=u8::MAX => match n & 0xF8 {
                     0x80 => {
                         //request sispm to be switched
                         let on = n & 0x04 != 0;
@@ -84,30 +86,6 @@ pub fn listen_for_vol_changes(listener: UnixListener, act: Arc<Mutex<Actor>>) {
 fn set_volume(act: &Arc<Mutex<Actor>>, vol: u8) {
     println!("Vol Requested: {}", vol);
     let cec = &act.lock().expect("could not lock for ctrl sock").cec;
-    if let Some(v) = cec.request_data(
-        CecLogicalAddress::Playback2,
-        CecLogicalAddress::Audiosystem,
-        CecOpcode::GiveAudioStatus,
-        b"",
-        CecOpcode::ReportAudioStatus,
-    ).ok().and_then(|d|d.first().copied()) {
-        println!("Vol is: Muted: {} Vol: {}%", v & 0x80, v & 0x7f);
-        let steps = vol as i8 - (v & 0x7f) as i8;
-        let key = if steps.is_positive() {
-            CecUserControlCode::VolumeUp
-        } else {
-            CecUserControlCode::VolumeDown
-        };
-        let steps = steps.unsigned_abs() * 2;
-        for _ in 0..steps {
-            if let Err(e) = cec.keypress(
-                CecLogicalAddress::Playback2,
-                CecLogicalAddress::Audiosystem,
-                key,
-            ) {
-                println!("<3>keypress Err: {:?}", e);
-                return;
-            }
-        }
-    }
+
+    super::set_volume(cec, vol, None);
 }
