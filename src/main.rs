@@ -20,10 +20,13 @@ use sock::{listen_for_vol_changes, setup_sock};
 pub struct GState {
     /// TV is playing
     tv: Option<bool>,
-    audio_mode: Option<bool>,
+    /// AVR is on the bus at the right address
     avr_ready: bool,
+    /// AVR power status. true==standby
     avr_standby: Option<bool>,
+    /// current address on the bus
     cec_addr: Option<CecLogicalAddress>,
+    /// current active source
     active_source: u16,
 }
 
@@ -123,7 +126,6 @@ fn main() -> std::io::Result<()> {
         thread::sleep(cycle_time);
         let GState {
             tv,
-            audio_mode: _,
             avr_ready,
             avr_standby,
             cec_addr,
@@ -139,6 +141,16 @@ fn main() -> std::io::Result<()> {
                 let m = actor.lock().expect("main lock");
                 switch_light(&m.pwr_socket, false);
                 if pulse {
+                    if let Some(from) = cec_addr {
+                        cec_audio_mode(&m.cec, from);
+                        // store volume
+                        set_volume(
+                            &m.cec,
+                            from,
+                            *snapclient_volume.lock().unwrap(),
+                            Some(&mut old_vol),
+                        );
+                    }
                     MediaState::Playing
                 } else {
                     MediaState::SwitchOff
@@ -219,7 +231,7 @@ fn main() -> std::io::Result<()> {
                         None => continue,
                     };
                     cec_audio_mode(&m.cec, from);
-                    let _ = request_pwr_state(&m.cec, from);
+                    //let _ = request_pwr_state(&m.cec, from);
                     // store volume
                     set_volume(
                         &m.cec,
@@ -310,7 +322,7 @@ fn main() -> std::io::Result<()> {
                 let m = actor.lock().expect("main lock");
 
                 cec_audio_mode(&m.cec, from);
-                let _ = request_pwr_state(&m.cec, from);
+                //let _ = request_pwr_state(&m.cec, from);
                 MediaState::Playing
             }
             MediaState::AVRHasPwr => {
@@ -331,8 +343,15 @@ fn main() -> std::io::Result<()> {
                     }
                     Some(false) => {
                         //AVR is on
-                        //TODO query Audio Address
-                        MediaState::WaitForAudio
+                        if let Some(from) = cec_addr {
+                            let m = actor.lock().expect("main lock");
+                            let _ = m.cec.transmit(
+                                from,
+                                CecLogicalAddress::Audiosystem,
+                                CecOpcode::GivePhysicalAddr
+                            );
+                        }
+                        MediaState::WaitForAudio 
                     }
                     Some(true) => {
                         //AVR is in standby
@@ -354,7 +373,10 @@ fn main() -> std::io::Result<()> {
                         //send AVR to standby first
                         let from = match cec_addr {
                             Some(a) => a,
-                            None => continue,
+                            None => {
+                                println!("no cec address");
+                                continue
+                            },
                         };
                         print_err(
                             m.cec.transmit(
@@ -392,9 +414,9 @@ fn main() -> std::io::Result<()> {
 }
 const SLEEP_TIME_CYCLE_MS: u64 = 250;
 /// 5.5s
-const CYCLES_TO_SWITCH_OFF: u8 = (5_500 / SLEEP_TIME_CYCLE_MS) as u8;
+const CYCLES_TO_SWITCH_OFF: u8 = (7_000 / SLEEP_TIME_CYCLE_MS) as u8;
 /// 4.5s
-const CYCLES_LONG_WAIT: u8 = (4_500 / SLEEP_TIME_CYCLE_MS) as u8;
+const CYCLES_LONG_WAIT: u8 = (5_500 / SLEEP_TIME_CYCLE_MS) as u8;
 
 ///request PWR state of Audiosystem and block till answered
 #[inline]
@@ -420,7 +442,6 @@ fn switch_avr(pwr_socket: &GlobalSiSPM, on: bool, state: &Arc<Mutex<GState>>) {
     let mut s = state.lock().unwrap();
     s.avr_ready = false;
     s.avr_standby = None;
-    s.audio_mode = None;
     print_err(pwr_socket.set_status(2, on), "pwr2");
 }
 #[derive(Copy, Clone, Debug)]
@@ -460,7 +481,8 @@ fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
 
     ...  the device requesting this information can send the volume-related <User Control Pressed> or <User Control Released> messages.
     */
-    print_err(
+
+    /*print_err(
         cec.transmit_data(
             from,
             CecLogicalAddress::Audiosystem,
@@ -468,7 +490,23 @@ fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
             b"\x33\x00",
         ),
         "SystemAudioModeRequest failed",
-    );
+    );*/
+    match cec.request_data(
+        from,
+        CecLogicalAddress::Audiosystem,
+        CecOpcode::SystemAudioModeRequest,
+        b"\x33\x00",
+        CecOpcode::SetSystemAudioMode,
+    ) {
+        Ok(v) => {
+            println!("SystemAudioMode: {:?}", v.first());
+            /*if v.first().is_some_and(|&v|v==1) {
+
+            }*/
+        }
+        Err(e) => println!("<3>SystemAudioModeRequest failed: {:?}", e),
+    }
+
     //print_err(cec.audio_get_status(),"GiveAudioStatus");
 }
 ///Print an error
@@ -483,14 +521,29 @@ fn cec_audio_mode_off(cec: &CecDevice, from: CecLogicalAddress) {
     <System Audio Mode Request> sent without a [Physical Address] parameter requests termination of the feature.
     In this case, the amplifier sends a <Set System Audio Mode> [Off] message.
         */
-    print_err(
+    /*print_err(
         cec.transmit(
             from,
             CecLogicalAddress::Audiosystem,
             CecOpcode::SystemAudioModeRequest,
         ),
         "SystemAudioModeRequest off",
-    );
+    );*/
+    match cec.request_data(
+        from,
+        CecLogicalAddress::Audiosystem,
+        CecOpcode::SystemAudioModeRequest,
+        b"",
+        CecOpcode::SetSystemAudioMode,
+    ) {
+        Ok(v) => {
+            println!("SystemAudioMode: {:?}", v.first());
+            /*if v.first().is_some_and(|&v|v==0) {
+
+            }*/
+        }
+        Err(e) => println!("<3>SystemAudioModeRequest off failed: {:?}", e),
+    }
 }
 
 fn set_volume(cec: &CecDevice, from: CecLogicalAddress, vol: u8, cur: Option<&mut u8>) {
