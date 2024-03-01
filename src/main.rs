@@ -4,17 +4,70 @@ use std::{thread, time,boxed::Box};
 use std::convert::TryInto;
 use sispm::{get_devices, GlobalSiSPM};
 use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::os::unix::net::UnixListener;
+use std::io::Read;
+use std::env;
+use std::os::fd::FromRawFd;
 
 mod pulse;
 ///Strg+C was received
 static mut DIE: bool = false;
 static mut PULSE_PLAYS: bool = false;
 
+#[derive(Default)]
+struct GState {
+  /// TV is playing
+  tv: Option<bool>,
+  audio_mode: Option<bool>,
+  avr_ready: bool,
+  avr_standby: Option<bool>,
+}
+
+fn listen_for_vol_changes(listener: UnixListener) {
+  let mut buf = [0u8;1];
+  for stream in listener.incoming() {
+    if let Ok(mut stream) = stream {
+      if let Ok(()) = stream.read_exact(&mut buf) {
+        //0-100 Vol
+        //&0x80 on/off
+        match buf[0] {
+          1..=100 => {
+          println!("Vol Requested: {}", buf[0]);
+          },
+          0 => println!("mute"),
+          n if n&0xF8 == 0x80 => {
+            let on = n&0x04!=0;
+            let n = n & 0x03;
+            println!("switch {} {}",n, on);
+          },
+          _ => println!("?"),
+        }
+      }
+    }
+  }
+}
+
 fn main() {
     ctrlc::set_handler(move || {
         unsafe {DIE = true;}
     })
     .expect("Error setting Ctrl-C handler");
+    
+    let pid = env::var("LISTEN_PID");
+    let fds = env::var("LISTEN_FDS");
+    //let env = env::vars();
+    println!("env {:?} {:?}", pid, fds);
+    let listener = if pid.ok().and_then(|x|x.parse::<u32>().ok()).is_some_and(|x| x == std::process::id())
+    && fds.ok().and_then(|x|x.parse::<usize>().ok()).is_some_and(|x|x==1) {
+        unsafe{UnixListener::from_raw_fd(3)}
+    }else{
+      UnixListener::bind("/tmp/cec_vol").expect("faild to listen on UDS")
+    };
+    thread::spawn(move || listen_for_vol_changes(listener));
+    
+    let global_state = Arc::new(Mutex::new(GState::default()));
+    let mut mutex = Arc::clone(&global_state);
 
     let cec_bus = CecConnectionCfgBuilder::default()
         .port("RPI".to_string())
@@ -22,7 +75,7 @@ fn main() {
         .device_types(CecDeviceTypeVec::new(CecDeviceType::PlaybackDevice))
         .base_device(CecLogicalAddress::Audiosystem).hdmi_port(3)
         .physical_address(0x3300)
-        .command_received_callback(Box::new(command))
+        .command_received_callback(Box::new(move |cmd: CecCommand| command(cmd, &mut mutex) ))
         .log_message_callback(Box::new(log))
         .key_press_callback(Box::new(key))
         .wake_devices(CecLogicalAddresses::default())
@@ -44,20 +97,19 @@ fn main() {
             .get_sink_input_info_list(pulse_callback);
     }).expect("pulse watcher");
 
-    let one_sec = time::Duration::from_millis(SLEEP_TIME_CYCLE_MS);
+    let cycle_time = time::Duration::from_millis(SLEEP_TIME_CYCLE_MS);
     let mut cycles_not_changed = 0;
     while !(unsafe {DIE}) {
-        let (
-            tv,
-            pulse,
-            avr_ready,
-            avr_standby
-        ) = unsafe{(
-            TV_STATUS,
-            PULSE_PLAYS,
-            AVR_READY,
-            AVR_STANDBY
-        )};
+        let GState {
+    tv,
+    audio_mode: _,
+    avr_ready,
+    avr_standby,
+  } = *global_state.lock().unwrap();
+  let pulse = unsafe { PULSE_PLAYS };
+    /*if avr_standby == Some(false) && target_vol != cec_vol {
+      
+    }*/
         state = match &state {
             MediaState::Watching if tv == Some(false) => {//TODO get_device_power_status to check AVR?
                 println!("Watching: {tv:?} {pulse}");
@@ -73,6 +125,7 @@ fn main() {
             MediaState::Playing if tv == Some(true) => {
                 println!("Playing: {tv:?} {pulse}");
                 // TV turned On
+//TODO restore vol
                 cec_audio_mode_off(&cec_bus);
                 switch_light(&pwr_socket, true);
                 MediaState::Watching
@@ -89,7 +142,7 @@ fn main() {
                 println!("Off: {tv:?} {pulse}");
                 // Turn On
                 cycles_not_changed = 0;
-                switch_avr(&pwr_socket, true);
+                switch_avr(&pwr_socket, true, &global_state);
                 MediaState::WaitForAudio
             },
             MediaState::WaitForAudio if avr_ready => {
@@ -168,7 +221,7 @@ fn main() {
                     if avr_standby==Some(true) {
                         // stay off
                         // this is enforcing a delay before cutting the AVR power
-                        switch_avr(&pwr_socket, false);
+                        switch_avr(&pwr_socket, false, &global_state);
                     }else{
                         //send AVR to standby first
                         print_err(cec_bus.send_standby_devices(CecLogicalAddress::Audiosystem),"SendStandbyDevices audio");
@@ -189,7 +242,7 @@ fn main() {
                 }
             }
         };
-        thread::sleep(one_sec);
+        thread::sleep(cycle_time);
     }
     println!("Bye");
 }
@@ -202,12 +255,11 @@ fn switch_light(pwr_socket: &GlobalSiSPM, on: bool) {
     print_err(pwr_socket.set_status(1, on),"pwr1");
 }
 #[inline]
-fn switch_avr(pwr_socket: &GlobalSiSPM, on: bool) {
-    unsafe {
-        AVR_READY=false;
-        AVR_STANDBY=None;
-        AUDIO_MODE=None;
-    }
+fn switch_avr(pwr_socket: &GlobalSiSPM, on: bool, state: &Arc<Mutex<GState>>) {
+  let mut s = state.lock().unwrap();
+  s.avr_ready = false;
+  s.avr_standby = None;
+  s.audio_mode = None;
     print_err(pwr_socket.set_status(2, on),"pwr2");
 }
 #[inline]
@@ -232,20 +284,16 @@ enum MediaState {
     /// Initial State - Audio has power, standby is unknown
     AVRHasPwr
 }
-/// TV is playing
-static mut TV_STATUS: Option<bool> = None;
-static mut AUDIO_MODE: Option<bool> = None;
-static mut AVR_READY:bool=false;
-static mut AVR_STANDBY:Option<bool>=None;
 
-fn command(cmd: CecCommand) {
+
+fn command(cmd: CecCommand, state: &mut Arc<Mutex<GState>>) {
     match cmd.opcode {
         CecOpcode::Standby if cmd.initiator == CecLogicalAddress::Tv => {
-            unsafe {TV_STATUS=Some(false);}
+          state.lock().unwrap().tv = Some(false);
             println!("======== Tv aus ===========")
         },
         CecOpcode::ActiveSource if cmd.initiator == CecLogicalAddress::Tv && cmd.parameters == slice_to_arr(&[0, 0]) => {
-            unsafe {TV_STATUS=Some(true);}
+          state.lock().unwrap().tv = Some(true);
             println!("======== TV an ===========")
         },
         CecOpcode::ReportAudioStatus if cmd.initiator == CecLogicalAddress::Audiosystem => {
@@ -266,29 +314,32 @@ a TV screen.
           println!("≈========tv realy on=========");
         },
         CecOpcode::SetSystemAudioMode => {
-            unsafe {AUDIO_MODE=cmd.parameters.0.get(0).map(|&b|b==1);AVR_STANDBY=Some(false);}
+          let mut s = state.lock().unwrap();
+          s.audio_mode = cmd.parameters.0.get(0).map(|&b|b==1);
+          s.avr_standby = Some(false);
         },
         CecOpcode::ReportPowerStatus if cmd.initiator == CecLogicalAddress::Audiosystem => {
+          state.lock().unwrap().avr_standby =
             match cmd.parameters.0.get(0) {
                 Some(1) /*| Some(3)*/ => {
                     //standby
                     println!("Updated AVR PWR: Some(true) -> standby");
-                    unsafe {AVR_STANDBY=Some(true);}
+                    Some(true)
                 },
                 Some(0) /*| Some(2)*/ => {
                     //on
                     println!("Updated AVR PWR: Some(false) -> on");
-                    unsafe {AVR_STANDBY=Some(false);}
+                    Some(false)
                 },
                 _ => {
                     println!("Updated AVR PWR: None");
-                    unsafe {AVR_STANDBY=None;}
+                    None
                 }
-            }            
+            };
         },
         CecOpcode::ReportPhysicalAddress if cmd.initiator == CecLogicalAddress::Audiosystem && cmd.parameters == slice_to_arr(&[0x30, 0, 5]) => {
             //audio became ready to receive commands
-            unsafe {AVR_READY=true;}
+            state.lock().unwrap().avr_ready = true;
         },
         CecOpcode::GiveDevicePowerStatus if cmd.initiator == CecLogicalAddress::Tv && cmd.destination == CecLogicalAddress::Playbackdevice2 => {
            //libCEC answers on its own
