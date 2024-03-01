@@ -1,139 +1,169 @@
-pub type Error = Box<dyn std::error::Error>;
-/// An alias to Result which overrides the default Error type.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+// Copyright The pipewire-rs Contributors.
+// SPDX-License-Identifier: MIT
 
-use libpulse_binding::{
-    context::{self, subscribe::Facility, Context, State},
-    mainloop::threaded::Mainloop,
-};
-use std::{
-    cell::RefCell,
-    fmt,
-    rc::Rc,
-};
+use pipewire as pw;
+use std::{cell::RefCell, collections::HashMap};
+use std::{rc::Rc, sync::Arc};
 
-const PA_NAME: &str = "xidlehook";
+use pw::link::Link;
+use pw::proxy::{Listener, ProxyListener, ProxyT};
+use pw::types::ObjectType;
+use pw::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Weak;
 
-/// See module-level docs
-pub struct NotWhenAudio {
-    ctx: Rc<RefCell<Context>>,
-    mainloop: Rc<RefCell<Mainloop>>,
+struct Proxies {
+    proxies_t: HashMap<u32, Box<dyn ProxyT>>,
+    listeners: HashMap<u32, Vec<Box<dyn Listener>>>,
 }
-impl NotWhenAudio {
-    /// Connect to `PulseAudio` and subscribe to notification of changes
-    pub fn new<F>(sink_callbacks: F) -> Result<Self> where F: Fn(&mut Context) + 'static {
-        let mainloop = Rc::new(RefCell::new(
-            Mainloop::new().ok_or("pulseaudio: failed to create main loop")?,
-        ));
 
-        let ctx = Rc::new(RefCell::new(
-            Context::new(&*mainloop.borrow(), PA_NAME)
-                .ok_or("pulseaudio: failed to create context")?,
-        ));
+impl Proxies {
+    fn new() -> Self {
+        Self {
+            proxies_t: HashMap::new(),
+            listeners: HashMap::new(),
+        }
+    }
 
-        // Setup context state change callback
-        {
-            let mainloop_ref = Rc::clone(&mainloop);
-            let ctx_ref = Rc::clone(&ctx);
+    fn add_proxy_t(&mut self, proxy_t: Box<dyn ProxyT>, listener: Box<dyn Listener>) {
+        let proxy_id = {
+            let proxy = proxy_t.upcast_ref();
+            proxy.id()
+        };
 
-            ctx.borrow_mut().set_state_callback(Some(Box::new(move || {
-                // Unfortunately, we need to bypass the runtime borrow
-                // checker here of RefCell here, see
-                // https://github.com/jnqnfe/pulse-binding-rust/issues/19
-                // for details.
-                let state = unsafe { &*ctx_ref.as_ptr() } // Borrow checker workaround
-                    .get_state();
-                match state {
-                    context::State::Ready | context::State::Failed | context::State::Terminated => {
-                        unsafe { &mut *mainloop_ref.as_ptr() } // Borrow checker workaround
-                            .signal(false);
-                    },
-                    _ => {},
+        self.proxies_t.insert(proxy_id, proxy_t);
+
+        let v = self.listeners.entry(proxy_id).or_insert_with(Vec::new);
+        v.push(listener);
+    }
+
+    fn add_proxy_listener(&mut self, proxy_id: u32, listener: ProxyListener) {
+        let v = self.listeners.entry(proxy_id).or_insert_with(Vec::new);
+        v.push(Box::new(listener));
+    }
+
+    fn remove(&mut self, proxy_id: u32) {
+        self.proxies_t.remove(&proxy_id);
+        self.listeners.remove(&proxy_id);
+    }
+}
+
+fn monitor(
+    shared1: Weak<AtomicBool>,
+    pw_receiver: pipewire::channel::Receiver<()>,
+) -> Result<(), Error> {
+    let shared2 = shared1.clone();
+
+    let main_loop = pw::MainLoop::new()?;
+    let _receiver = pw_receiver.attach(&main_loop, {
+        let main_loop = main_loop.clone();
+        move |_| main_loop.quit()
+    });
+
+    let context = pw::Context::new(&main_loop)?;
+    let core = context.connect(None)?;
+
+    let registry = Arc::new(core.get_registry()?);
+    let registry_weak = Arc::downgrade(&registry);
+
+    // Proxies and their listeners need to stay alive so store them here
+    let proxies = Rc::new(RefCell::new(Proxies::new()));
+
+    let map = Arc::new(RefCell::new(HashMap::new()));
+    let map_weak = Arc::downgrade(&map);
+    let map_weak2 = Arc::downgrade(&map);
+
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |obj| {
+            if let Some(registry) = registry_weak.upgrade() {
+                let p: Option<(Box<dyn ProxyT>, Box<dyn Listener>)> = match obj.type_ {
+                    ObjectType::Link => {
+                        let link: Link = registry.bind(obj).unwrap();
+                        let map_super_weak = map_weak.clone();
+                        let shared2 = shared1.clone();
+                        let obj_listener = link
+                            .add_listener_local()
+                            .info(move |info| {
+                                if let Some(m) = map_super_weak.upgrade() {
+                                    let mut m = m.borrow_mut();
+                                    match info.state() {
+                                        pw::link::LinkState::Active => {
+                                            m.entry(info.output_node_id()).or_insert(());
+                                        }
+                                        _ => {
+                                            m.remove(&(info.output_node_id()));
+                                        }
+                                    }
+                                    let old = shared2
+                                        .upgrade()
+                                        .unwrap()
+                                        .swap(!m.is_empty(), Ordering::Relaxed);
+                                    if old == m.is_empty() {
+                                        println!("pipewire {}", !old);
+                                    }
+                                }
+                            })
+                            .register();
+                        Some((Box::new(link), Box::new(obj_listener)))
+                    }
+                    _ => None,
+                };
+
+                if let Some((proxy_spe, listener_spe)) = p {
+                    let proxy = proxy_spe.upcast_ref();
+                    let proxy_id = proxy.id();
+                    // Use a weak ref to prevent references cycle between Proxy and proxies:
+                    // - ref on proxies in the closure, bound to the Proxy lifetime
+                    // - proxies owning a ref on Proxy as well
+                    let proxies_weak = Rc::downgrade(&proxies);
+
+                    let listener = proxy
+                        .add_listener_local()
+                        .removed(move || {
+                            if let Some(proxies) = proxies_weak.upgrade() {
+                                proxies.borrow_mut().remove(proxy_id);
+                            }
+                        })
+                        .register();
+
+                    proxies.borrow_mut().add_proxy_t(proxy_spe, listener_spe);
+                    proxies.borrow_mut().add_proxy_listener(proxy_id, listener);
                 }
-            })));
-        }
-
-        ctx.borrow_mut()
-            .connect(None, context::FlagSet::empty(), None)
-            .map_err(|err| format!("pulseaudio: failed to connect context: {}", err))?;
-
-        mainloop.borrow_mut().lock();
-
-        if let Err(err) = mainloop.borrow_mut().start() {
-            mainloop.borrow_mut().unlock();
-            return Err(Error::from(format!(
-                "pulseaudio: failed to start mainloop: {}",
-                err
-            )));
-        }
-
-        // Wait for context to be ready
-        loop {
-            match ctx.borrow().get_state() {
-                State::Ready => {
-                    break;
-                },
-                State::Failed | State::Terminated => {
-                    mainloop.borrow_mut().unlock();
-                    mainloop.borrow_mut().stop();
-                    return Err("pulseaudio: context state failed/terminated unexpectedly".into());
-                },
-                _ => {
-                    mainloop.borrow_mut().wait();
-                },
             }
-        }
-        ctx.borrow_mut().set_state_callback(None);
-
-sink_callbacks(&mut ctx.borrow_mut());
-        // Setup notification callback
-        //
-        // Upon notification of a change, we will make use of introspection
-        // to obtain a fresh count of active input sinks.
-        {
-            let ctx_ref = Rc::clone(&ctx);
-
-            ctx.borrow_mut()
-                .set_subscribe_callback(Some(Box::new(move |obj, op, _| {
-
-                    println!("{:?} {:?}",obj,op);
-                    //Some(SinkInput) Some(New)
-                    //Some(SinkInput) Some(Removed)
-
-                    let ctx_ref = unsafe { &mut *ctx_ref.as_ptr() }; // Borrow checker workaround
-                    //ctx.borrow_mut().introspect().get_sink_info_by_index(index, callback)
-
-                    sink_callbacks(ctx_ref);
-                })));
-        }
-
-        // Subscribe to sink input events
-        ctx.borrow_mut()
-            .subscribe(Facility::SinkInput.to_interest_mask(), |_| ());
-
-        // Check if audio is already playing
-//        sink_callbacks(&mut ctx.borrow_mut());
-
-        mainloop.borrow_mut().unlock();
-
-        Ok(Self {
-            ctx,
-            mainloop,
         })
-    }
+        .global_remove(move |id| {
+            if let Some(map) = map_weak2.upgrade() {
+                let mut mm = map.borrow_mut();
+                mm.remove(&id);
+                let old = shared2
+                    .upgrade()
+                    .unwrap()
+                    .swap(!mm.is_empty(), Ordering::Relaxed);
+                if old == mm.is_empty() {
+                    println!("pipewire {}", !old);
+                }
+            }
+        })
+        .register();
+
+    main_loop.run();
+    println!("pipewire done");
+
+    Ok(())
 }
-impl fmt::Debug for NotWhenAudio {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "NotWhenAudio")
+
+pub fn watch(
+    shared1: Weak<AtomicBool>,
+    pw_receiver: pipewire::channel::Receiver<()>,
+) -> Result<(), Error> {
+    pw::init();
+
+    monitor(shared1, pw_receiver)?;
+
+    unsafe {
+        pw::deinit();
     }
-}
-impl Drop for NotWhenAudio {
-    fn drop(&mut self) {
-//        debug!("Stopping PulseAudio main loop");
-        self.mainloop.borrow_mut().stop();
-        self.mainloop.borrow_mut().lock();
-        self.ctx.borrow_mut().disconnect();
-        self.mainloop.borrow_mut().unlock();
-//        debug!("Stopped");
-    }
+
+    Ok(())
 }

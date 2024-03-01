@@ -1,13 +1,13 @@
 [package]
 name = "cecremote"
-version = "0.2.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 
 [dependencies]
 cec_linux = {version="*", features=["poll"]}
 sispm = "*"
 ctrlc = "*"
-libpulse-binding="*"
+pipewire = "*"
 
 [profile.release]
 lto = "fat"
