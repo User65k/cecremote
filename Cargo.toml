@@ -1,0 +1,16 @@
+[package]
+name = "cecremote"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+cec-rs = "6.0"
+sispm = "*"
+ctrlc = "*"
+libpulse-binding="*"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+#panic = "abort"
