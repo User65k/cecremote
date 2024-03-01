@@ -66,11 +66,28 @@ pub fn listen_for_vol_changes(listener: UnixListener, act: Arc<Mutex<Actor>>) {
 
                         let act = act.lock().expect("could not lock for ctrl sock");
 
-                        let from = match act.cec.get_log()
-                        .ok().and_then(|l|l.addresses().first().copied()).unwrap_or(CecLogicalAddress::UnregisteredBroadcast) {
+                        let from = match act
+                            .cec
+                            .get_log()
+                            .ok()
+                            .and_then(|l| l.addresses().first().copied())
+                            .unwrap_or(CecLogicalAddress::UnregisteredBroadcast)
+                        {
                             CecLogicalAddress::UnregisteredBroadcast => continue,
-                            a => a
+                            a => a,
                         };
+                        /*.map_or(0xff, |l| l.log_addr[0]) {
+                            0xff => {
+                                //not connected
+                                continue;
+                            }
+                            0xf => {
+                                //not registered
+                                continue;
+                            }
+                            f @ 0..=0xe => CecLogicalAddress::try_from(f).unwrap(),
+                            _ => unreachable!("no cec address"),
+                        };*/
 
                         print_err(
                             act.cec.transmit_data(
@@ -94,11 +111,27 @@ fn set_volume(act: &Arc<Mutex<Actor>>, vol: u8) {
     println!("Vol Requested: {}", vol);
     let cec = &act.lock().expect("could not lock for ctrl sock").cec;
 
-    let from = match cec.get_log()
-    .ok().and_then(|l|l.addresses().first().copied()).unwrap_or(CecLogicalAddress::UnregisteredBroadcast) {
+    let from = match cec
+        .get_log()
+        .ok()
+        .and_then(|l| l.addresses().first().copied())
+        .unwrap_or(CecLogicalAddress::UnregisteredBroadcast)
+    {
         CecLogicalAddress::UnregisteredBroadcast => return,
-        a => a
+        a => a,
     };
+    /*.map_or(0xff, |l| l.log_addr[0]) {
+        0xff => {
+            //not connected
+            return;
+        }
+        0xf => {
+            //not registered
+            return;
+        }
+        f @ 0..=0xe => CecLogicalAddress::try_from(f).unwrap(),
+        _ => unreachable!("no cec address"),
+    }; */
 
     super::set_volume(cec, from, vol, None);
 }
