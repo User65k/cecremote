@@ -1,4 +1,5 @@
 use cec_linux::{
+    CecEvent, CecEventStateChange,
     CecDevice, CecLogAddrType, CecLogAddrs, CecLogicalAddress, CecModeFollower, CecModeInitiator,
     CecOpcode, CecPowerStatus, CecPrimDevType, CecUserControlCode, Version, CEC_VENDOR_ID_NONE,
 };
@@ -65,15 +66,13 @@ fn main() -> std::io::Result<()> {
     let log = CecLogAddrs::default();
     cec_bus.set_log(log)?;
     //set address
-    let log = CecLogAddrs {
-        cec_version: Version::V1_4,
-        num_log_addrs: 1,
-        vendor_id: CEC_VENDOR_ID_NONE,
-        osd_name: "pi4".to_string().try_into().unwrap(),
-        primary_device_type: [CecPrimDevType::PLAYBACK; 4],
-        log_addr_type: [CecLogAddrType::PLAYBACK; 4],
-        ..Default::default()
-    };
+    let log = CecLogAddrs::new(
+        CEC_VENDOR_ID_NONE,
+        Version::V1_4,
+        "pi4".to_string().try_into().unwrap(),
+        &[CecPrimDevType::PLAYBACK],
+        &[CecLogAddrType::PLAYBACK]
+    );
     cec_bus.set_log(log)?;
     //cec_bus.set_phys(0x3300)?;
 
@@ -117,6 +116,8 @@ fn main() -> std::io::Result<()> {
     thread::spawn(move || {
         snapclient_mitm::main(shared1, act, snapclient_vol, snapclient_vchanged).expect("mitm err")
     });
+    //wait for snapclient to start and all
+    thread::sleep(time::Duration::from_secs(5));
 
     let cycle_time = time::Duration::from_millis(SLEEP_TIME_CYCLE_MS);
     let mut cycles_not_changed = 0;
@@ -228,18 +229,26 @@ fn main() -> std::io::Result<()> {
                 } else if pulse {
                     let from = match cec_addr {
                         Some(a) => a,
-                        None => continue,
+                        None => {
+                            let _ = wait_for_addr(&m.cec);
+                            continue
+                        },
                     };
                     cec_audio_mode(&m.cec, from);
-                    //let _ = request_pwr_state(&m.cec, from);
-                    // store volume
-                    set_volume(
-                        &m.cec,
-                        from,
-                        *snapclient_volume.lock().unwrap(),
-                        Some(&mut old_vol),
-                    );
-                    MediaState::Playing
+                    if let Some(CecPowerStatus::On) = request_pwr_state(&m.cec, from) {
+                        // store volume
+                        set_volume(
+                            &m.cec,
+                            from,
+                            *snapclient_volume.lock().unwrap(),
+                            Some(&mut old_vol),
+                        );
+                        MediaState::Playing
+                    }else{
+                        //retry cec audio mode
+                        cycles_not_changed += 1;
+                        continue;
+                    }
                 } else {
                     println!("<3>TV and Audio off. No need for AVR anymore");
                     MediaState::SwitchOff
@@ -285,8 +294,9 @@ fn main() -> std::io::Result<()> {
                                 CecOpcode::SystemAudioModeStatus,
                             )
                             .ok()
-                            .and_then(|data| data.first().copied())
-                            .is_some_and(|v| v == 1)
+                            //.and_then(|data| data.first().copied())
+                            //.is_some_and(|v| v == 1)
+                            .is_some_and(|v|v==[0x33,0])
                         {
                             println!("<4>But AVR is already in SystemAudioMode");
                             continue;
@@ -315,14 +325,19 @@ fn main() -> std::io::Result<()> {
                 //snapcast is running but AVR is off
                 // none -> ask for standby status
                 println!("<5>Playing: avr standby: {avr_standby:?}"); //None -> is not the reason the TV turns on
+                cycles_not_changed += 1;
+                let m = actor.lock().expect("main lock");
                 let from = match cec_addr {
                     Some(a) => a,
-                    None => continue,
+                    None => {
+                        println!("not connected to bus");
+                        let _ = wait_for_addr(&m.cec);
+                        continue;
+                    },
                 };
-                let m = actor.lock().expect("main lock");
 
                 cec_audio_mode(&m.cec, from);
-                //let _ = request_pwr_state(&m.cec, from);
+                let _ = request_pwr_state(&m.cec, from);
                 MediaState::Playing
             }
             MediaState::AVRHasPwr => {
@@ -375,6 +390,7 @@ fn main() -> std::io::Result<()> {
                             Some(a) => a,
                             None => {
                                 println!("no cec address");
+                                let _ = wait_for_addr(&m.cec);
                                 continue
                             },
                         };
@@ -482,7 +498,7 @@ fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
     ...  the device requesting this information can send the volume-related <User Control Pressed> or <User Control Released> messages.
     */
 
-    /*print_err(
+    print_err(
         cec.transmit_data(
             from,
             CecLogicalAddress::Audiosystem,
@@ -490,8 +506,8 @@ fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
             b"\x33\x00",
         ),
         "SystemAudioModeRequest failed",
-    );*/
-    match cec.request_data(
+    );
+    /*match cec.request_data(
         from,
         CecLogicalAddress::Audiosystem,
         CecOpcode::SystemAudioModeRequest,
@@ -499,13 +515,13 @@ fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
         CecOpcode::SetSystemAudioMode,
     ) {
         Ok(v) => {
-            println!("SystemAudioMode: {:?}", v.first());
+            println!("SystemAudioMode on: {:?}", v);
             /*if v.first().is_some_and(|&v|v==1) {
 
             }*/
         }
         Err(e) => println!("<3>SystemAudioModeRequest failed: {:?}", e),
-    }
+    }*/
 
     //print_err(cec.audio_get_status(),"GiveAudioStatus");
 }
@@ -537,7 +553,7 @@ fn cec_audio_mode_off(cec: &CecDevice, from: CecLogicalAddress) {
         CecOpcode::SetSystemAudioMode,
     ) {
         Ok(v) => {
-            println!("SystemAudioMode: {:?}", v.first());
+            println!("SystemAudioMode off: {:?}", v);
             /*if v.first().is_some_and(|&v|v==0) {
 
             }*/
@@ -574,6 +590,19 @@ fn set_volume(cec: &CecDevice, from: CecLogicalAddress, vol: u8, cur: Option<&mu
                 println!("<3>keypress Err: {:?}", e);
                 return;
             }
+        }
+    }
+}
+
+fn wait_for_addr(cec: &CecDevice) -> std::io::Result<()> {
+    loop {
+        match cec.get_event()? {
+            CecEvent::StateChange(CecEventStateChange { phys_addr, log_addr_mask }) => {
+                if phys_addr != 0xffff && !log_addr_mask.is_empty() {
+                    return Ok(())
+                }
+            },
+            _ => continue,
         }
     }
 }
