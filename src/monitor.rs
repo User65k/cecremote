@@ -84,6 +84,7 @@ fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
         CecOpcode::SetSystemAudioMode => {
             let mut s = state.lock().unwrap();
             //s.audio_mode = cmd.parameters().first().map(|&b| b == 1);
+            println!("SetSystemAudioMode is {:?}", cmd.parameters());
             s.avr_standby = Some(false);
         }
         CecOpcode::ReportPowerStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
