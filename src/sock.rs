@@ -1,5 +1,5 @@
-use crate::{Actor, print_err};
-use cec_linux::{CecLogicalAddress, CecOpcode, CecUserControlCode};
+use crate::{print_err, Actor};
+use cec_linux::CecLogicalAddress;
 use std::env;
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -63,17 +63,31 @@ pub fn listen_for_vol_changes(listener: UnixListener, act: Arc<Mutex<Actor>>) {
                         //                              ? = Ps4
                         //4 blueRay, 1 DVD/BlueRay, 2 Media Player
                         let data = [0x30 + (n & 7), 0];
+
+                        let act = act.lock().expect("could not lock for ctrl sock");
+
+                        let from = match act.cec.get_log().map_or(0xff, |l| l.log_addr[0]) {
+                            0xff => {
+                                //not connected
+                                continue;
+                            }
+                            0xf => {
+                                //not registered
+                                continue;
+                            }
+                            f @ 0..=0xe => CecLogicalAddress::try_from(f).unwrap(),
+                            _ => unreachable!("no cec address"),
+                        };
+
                         print_err(
-                            act.lock()
-                            .expect("could not lock for ctrl sock")
-                            .cec
-                            .transmit_data(
-                                CecLogicalAddress::Playback2,
+                            act.cec.transmit_data(
+                                from,
                                 CecLogicalAddress::UnregisteredBroadcast,
                                 cec_linux::CecOpcode::ActiveSource,
                                 &data,
                             ),
-                            "cec boom SetStreamPath");
+                            "cec boom SetStreamPath",
+                        );
                     }
                     _ => println!("?"),
                 },
@@ -87,5 +101,18 @@ fn set_volume(act: &Arc<Mutex<Actor>>, vol: u8) {
     println!("Vol Requested: {}", vol);
     let cec = &act.lock().expect("could not lock for ctrl sock").cec;
 
-    super::set_volume(cec, vol, None);
+    let from = match cec.get_log().map_or(0xff, |l| l.log_addr[0]) {
+        0xff => {
+            //not connected
+            return;
+        }
+        0xf => {
+            //not registered
+            return;
+        }
+        f @ 0..=0xe => CecLogicalAddress::try_from(f).unwrap(),
+        _ => unreachable!("no cec address"),
+    };
+
+    super::set_volume(cec, from, vol, None);
 }

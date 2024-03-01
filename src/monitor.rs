@@ -2,8 +2,8 @@ use crate::GState;
 use cec_linux::{
     CecDevice, CecEvent, CecLogAddrMask, CecLogicalAddress, CecMsg, CecOpcode, PollFlags,
 };
-use std::sync::{Arc, Mutex};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 pub fn mon(cec_mon: CecDevice, mut mutex: Arc<Mutex<GState>>) {
     loop {
@@ -16,8 +16,7 @@ pub fn mon(cec_mon: CecDevice, mut mutex: Arc<Mutex<GState>>) {
         if f.intersects(PollFlags::POLLPRI) {
             if let CecEvent::StateChange(s) = cec_mon.get_event().unwrap() {
                 println!("<7>{:?}", s);
-                let on =
-                if s.log_addr_mask.contains(CecLogAddrMask::Playback1) {
+                let on = if s.log_addr_mask.contains(CecLogAddrMask::Playback1) {
                     mutex.lock().unwrap().cec_addr = Some(CecLogicalAddress::Playback1);
                     true
                 } else if s.log_addr_mask.contains(CecLogAddrMask::Playback2) {
@@ -34,11 +33,14 @@ pub fn mon(cec_mon: CecDevice, mut mutex: Arc<Mutex<GState>>) {
                     let runs = Command::new("systemctl")
                         .args(["--user", "is-active", "pipewire"])
                         .output()
-                        .expect("exec").stdout == b"active\n";
+                        .expect("exec")
+                        .stdout
+                        == b"active\n";
                     if !runs {
                         Command::new("systemctl")
                             .args(["--user", "start", "pipewire"])
-                            .status().expect("restart");
+                            .status()
+                            .expect("restart");
                     }
                 }
             }
@@ -61,10 +63,17 @@ fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
             println!("======== Tv aus ===========")
         }
         CecOpcode::ActiveSource
-            if cmd.initiator() == CecLogicalAddress::Tv && cmd.parameters() == [0, 0] =>
+            //if cmd.initiator() == CecLogicalAddress::Tv && cmd.parameters() == [0, 0]
+            =>
         {
-            state.lock().unwrap().tv = Some(true);
-            println!("======== TV an ===========")
+            let mut s = state.lock().unwrap();
+            s.tv = Some(true);
+            if let Ok(ba) = cmd.parameters()[0..2].try_into() {
+                s.active_source = u16::from_be_bytes(ba);
+            }else{
+                s.active_source = 0xffff;
+            }
+            println!("======== {:x} an ===========", s.active_source);
         }
         /*CecOpcode::ReportAudioStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
             /*
