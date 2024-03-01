@@ -1,4 +1,4 @@
-use cec_rs::{CecConnectionCfgBuilder, CecLogicalAddress, CecCommand, CecLogMessage, CecDeviceType, CecDeviceTypeVec, CecKeypress, CecOpcode, CecDatapacket, CecConnection, CecLogicalAddresses};
+use cec_linux::{CecDevice, CecModeFollower, CecModeInitiator, CecLogAddrs, OSDStr, CecPrimDevType, CecLogAddrType, Version, CEC_VENDOR_ID_NONE, CecMsg, CecOpcode, CecLogicalAddress, CecEvent, CecLogAddrMask, PollFlags};
 use libpulse_binding::{context::introspect::SinkInputInfo, callbacks::ListResult};
 use std::{thread, time,boxed::Box};
 use std::convert::TryInto;
@@ -22,12 +22,13 @@ struct GState {
   audio_mode: Option<bool>,
   avr_ready: bool,
   avr_standby: Option<bool>,
+  cec_addr: Option<CecLogicalAddress>
 }
 
 fn listen_for_vol_changes(listener: UnixListener) {
   let mut buf = [0u8;1];
-  for stream in listener.incoming() {
-    if let Ok(mut stream) = stream {
+  for mut stream in listener.incoming().flatten() {
+    //if let Ok(mut stream) = stream {
       if let Ok(()) = stream.read_exact(&mut buf) {
         //0-100 Vol
         //&0x80 on/off
@@ -37,6 +38,7 @@ fn listen_for_vol_changes(listener: UnixListener) {
           },
           0 => println!("mute"),
           n if n&0xF8 == 0x80 => {
+            //request sispm to be switched
             let on = n&0x04!=0;
             let n = n & 0x03;
             println!("switch {} {}",n, on);
@@ -44,24 +46,30 @@ fn listen_for_vol_changes(listener: UnixListener) {
           _ => println!("?"),
         }
       }
-    }
+    //}
   }
 }
 
-fn main() {
-    ctrlc::set_handler(move || {
+fn main() -> std::io::Result<()> {
+    if let Err(e) = ctrlc::set_handler(move || {
         unsafe {DIE = true;}
-    })
-    .expect("Error setting Ctrl-C handler");
+    }) {
+        match e {
+            ctrlc::Error::NoSuchSignal(_) => unreachable!(),
+            ctrlc::Error::MultipleHandlers => return Err(std::io::ErrorKind::AlreadyExists.into()),
+            ctrlc::Error::System(e) => return Err(e),
+        }
+    }
     
     let pid = env::var("LISTEN_PID");
     let fds = env::var("LISTEN_FDS");
     //let env = env::vars();
-    println!("env {:?} {:?}", pid, fds);
+    //println!("env {:?} {:?}", pid, fds);
     let listener = if pid.ok().and_then(|x|x.parse::<u32>().ok()).is_some_and(|x| x == std::process::id())
     && fds.ok().and_then(|x|x.parse::<usize>().ok()).is_some_and(|x|x==1) {
         unsafe{UnixListener::from_raw_fd(3)}
     }else{
+      println!("no FD");
       UnixListener::bind("/tmp/cec_vol").expect("faild to listen on UDS")
     };
     thread::spawn(move || listen_for_vol_changes(listener));
@@ -69,17 +77,57 @@ fn main() {
     let global_state = Arc::new(Mutex::new(GState::default()));
     let mut mutex = Arc::clone(&global_state);
 
-    let cec_bus = CecConnectionCfgBuilder::default()
-        .port("RPI".to_string())
-        .device_name("pi4".to_string())
-        .device_types(CecDeviceTypeVec::new(CecDeviceType::PlaybackDevice))
-        .base_device(CecLogicalAddress::Audiosystem).hdmi_port(3)
-        .physical_address(0x3300)
-        .command_received_callback(Box::new(move |cmd: CecCommand| command(cmd, &mut mutex) ))
-        .log_message_callback(Box::new(log))
-        .key_press_callback(Box::new(key))
-        .wake_devices(CecLogicalAddresses::default())
-        .build().expect("cec build").open().expect("cec open");
+    //send
+    let cec_bus = CecDevice::open("/dev/cec0")?;
+    let capas = cec_bus.get_capas()?;
+    println!("capas  {:?}", capas);
+    //cec_bus.set_mode(CecModeInitiator::Send, CecModeFollower::RepliesOnly)?;
+    //monitor
+    let cec_mon = CecDevice::open("/dev/cec0")?;
+    cec_mon.set_mode(CecModeInitiator::None, CecModeFollower::Monitor)?;
+    
+    //clear address
+    let log = CecLogAddrs::default();
+    cec_bus.set_log(log)?;
+    //set address
+    let log = CecLogAddrs {
+        cec_version: Version::V1_4,
+        num_log_addrs: 1,
+        vendor_id: CEC_VENDOR_ID_NONE,
+        osd_name: "pi4".to_string().try_into().unwrap(),
+        primary_device_type: [CecPrimDevType::PLAYBACK; 4],
+        log_addr_type: [CecLogAddrType::PLAYBACK; 4],
+        ..Default::default()
+    };
+    cec_bus.set_log(log)?;
+    //cec_bus.set_phys(0x3300)?;
+    
+    //.base_device(CecLogicalAddress::Audiosystem).hdmi_port(3)
+    //.physical_address(0x3300) //3.3.0.0
+    thread::spawn(move || loop {
+        let f = cec_mon.poll(
+            PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLPRI,
+            -1,
+        ).unwrap();
+        if f.intersects(PollFlags::POLLPRI) {
+            if let CecEvent::StateChange(s) = cec_mon.get_event().unwrap() {
+                println!("<7>{:?}", s);
+                if s.log_addr_mask.contains(CecLogAddrMask::Playback1) {
+                    mutex.lock().unwrap().cec_addr = Some(CecLogicalAddress::Playback1);
+                }else if s.log_addr_mask.contains(CecLogAddrMask::Playback2) {
+                    mutex.lock().unwrap().cec_addr = Some(CecLogicalAddress::Playback2);
+                }else if s.log_addr_mask.contains(CecLogAddrMask::Playback3) {
+                    mutex.lock().unwrap().cec_addr = Some(CecLogicalAddress::Playback3);
+                }else{
+                    mutex.lock().unwrap().cec_addr = None;
+                }
+            }
+        }
+        if f.contains(PollFlags::POLLIN | PollFlags::POLLRDNORM) {
+            let msg = cec_mon.rec().unwrap();
+            command(msg, &mut mutex)
+        }
+    });
 
     let pwr_socket = get_devices().expect("on pwr socket")
         .pop().expect("no pwr socket connected");
@@ -105,6 +153,7 @@ fn main() {
     audio_mode: _,
     avr_ready,
     avr_standby,
+    cec_addr,    
   } = *global_state.lock().unwrap();
   let pulse = unsafe { PULSE_PLAYS };
     /*if avr_standby == Some(false) && target_vol != cec_vol {
@@ -126,7 +175,9 @@ fn main() {
                 println!("Playing: {tv:?} {pulse}");
                 // TV turned On
 //TODO restore vol
-                cec_audio_mode_off(&cec_bus);
+                if let Some(from) = cec_addr {
+                    cec_audio_mode_off(&cec_bus, from);
+                }
                 switch_light(&pwr_socket, true);
                 MediaState::Watching
             },
@@ -134,12 +185,16 @@ fn main() {
                 println!("Playing: {tv:?} {pulse}");
                 // Audio turned Off
 //TODO restore vol
-                cec_audio_mode_off(&cec_bus);
+                let from = match cec_addr {
+                    Some(a) => a,
+                    None => continue
+                };
+                cec_audio_mode_off(&cec_bus, from);
                 switch_subwoofer(&pwr_socket, false);
                 MediaState::Off
             },
             MediaState::Off if pulse || tv == Some(true) => {
-                println!("Off: {tv:?} {pulse}");
+                println!("Off: tv={tv:?} pulse={pulse}");
                 // Turn On
                 cycles_not_changed = 0;
                 switch_avr(&pwr_socket, true, &global_state);
@@ -155,53 +210,67 @@ fn main() {
                 if tv == Some(true) {
                     switch_light(&pwr_socket, true);
                     MediaState::Watching
+                }else if pulse {
+                    //TODO store volume
+                    let from = match cec_addr {
+                        Some(a) => a,
+                        None => continue
+                    };
+                    cec_audio_mode(&cec_bus, from);
+                    print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::GiveDevicePowerStatus),"Request AVR stadby state");
+                    MediaState::Playing
                 }else{
-                    if pulse {
-                        //TODO store volume
-                        cec_audio_mode(&cec_bus);
-                        print_err(cec_bus.get_device_power_status(CecLogicalAddress::Audiosystem),"Request AVR stadby state");
-                        MediaState::Playing
-                    }else{
-                        println!("<3>TV and Audio off. No need for AVR anymore");
-                        MediaState::Off
-                    }
+                    println!("<3>TV and Audio off. No need for AVR anymore");
+                    MediaState::Off
                 }
             },
             MediaState::WaitForAudio if cycles_not_changed == THREE_SEC_IN_CYCLES => {
                 //AVR wont turn on but has power
                 println!("<4>WaitForAudio takes too long");
-                if tv == Some(true) {
-                    print_err(cec_bus.send_power_on_devices(CecLogicalAddress::Audiosystem),"PwrOn audio");
-                }else{
-                    if pulse {
-                        cec_audio_mode(&cec_bus);
-                    }
-                }
                 cycles_not_changed += 1;
+                let from = match cec_addr {
+                    Some(a) => a,
+                    None => continue
+                };
+                if tv == Some(true) {
+                    print_err(cec_bus.turn_on(from, CecLogicalAddress::Audiosystem),"PwrOn audio");
+                }else if pulse {
+                    cec_audio_mode(&cec_bus, from);
+                }
                 MediaState::WaitForAudio
             },
             MediaState::Watching if avr_standby != Some(false) => {
                 println!("<5>Watching: avr standby: {avr_standby:?}");
+                let from = match cec_addr {
+                    Some(a) => a,
+                    None => continue
+                };
                 //TV is running but audio is off
-                print_err(cec_bus.send_power_on_devices(CecLogicalAddress::Audiosystem),"PwrOn audio");
+                print_err(cec_bus.turn_on(from, CecLogicalAddress::Audiosystem),"PwrOn audio");
                 //TODO request PWR state?
-                print_err(cec_bus.get_device_power_status(CecLogicalAddress::Audiosystem),"Request AVR stadby state");
+                print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::GiveDevicePowerStatus),"Request AVR stadby state");
                 MediaState::Watching
             },
             MediaState::Playing if avr_standby != Some(false) => {
             // none -> ask for standby status
                 println!("<5>Playing: avr standby: {avr_standby:?}"); //None -> is not the reason the TV turns on
+                let from = match cec_addr {
+                    Some(a) => a,
+                    None => continue
+                };
                 //Pulse is running but audio is off
-                cec_audio_mode(&cec_bus);
-                print_err(cec_bus.get_device_power_status(CecLogicalAddress::Audiosystem),"Request AVR stadby state");
+                cec_audio_mode(&cec_bus, from);
+                print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::GiveDevicePowerStatus),"Request AVR stadby state");
                 MediaState::Playing
             },
             MediaState::AVRHasPwr => {
                 println!("AVRHasPwr: {avr_standby:?}");
                 match avr_standby {
                   None => {
-                    // Seriice started, dont know whats up
-                    print_err(cec_bus.get_device_power_status(CecLogicalAddress::Audiosystem),"Request AVR stadby state");
+                    // Service started, dont know whats up
+                    if let Some(from) = cec_addr {
+                        print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::GiveDevicePowerStatus),"Request AVR stadby state");
+                    }
                     MediaState::AVRHasPwr
                   },
                   Some(false) => {
@@ -224,8 +293,12 @@ fn main() {
                         switch_avr(&pwr_socket, false, &global_state);
                     }else{
                         //send AVR to standby first
-                        print_err(cec_bus.send_standby_devices(CecLogicalAddress::Audiosystem),"SendStandbyDevices audio");
-                        print_err(cec_bus.get_device_power_status(CecLogicalAddress::Audiosystem),"Request AVR stadby state");
+                        let from = match cec_addr {
+                            Some(a) => a,
+                            None => continue
+                        };
+                        print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::Standby),"SendStandbyDevices audio");
+                        print_err(cec_bus.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::GiveDevicePowerStatus),"Request AVR stadby state");
                     }
                 }
                 MediaState::Off
@@ -245,6 +318,7 @@ fn main() {
         thread::sleep(cycle_time);
     }
     println!("Bye");
+    Ok(())
 }
 const SLEEP_TIME_CYCLE_MS: u64 = 250;
 const FOUR_SEC_IN_CYCLES: u8 = (4_000/SLEEP_TIME_CYCLE_MS) as u8;
@@ -286,17 +360,21 @@ enum MediaState {
 }
 
 
-fn command(cmd: CecCommand, state: &mut Arc<Mutex<GState>>) {
-    match cmd.opcode {
-        CecOpcode::Standby if cmd.initiator == CecLogicalAddress::Tv => {
+fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
+    let opcode = match cmd.opcode() {
+        Some(Ok(opc)) => opc,
+        _ => return,
+    };
+    match opcode {
+        CecOpcode::Standby if cmd.initiator() == CecLogicalAddress::Tv => {
           state.lock().unwrap().tv = Some(false);
             println!("======== Tv aus ===========")
         },
-        CecOpcode::ActiveSource if cmd.initiator == CecLogicalAddress::Tv && cmd.parameters == slice_to_arr(&[0, 0]) => {
+        CecOpcode::ActiveSource if cmd.initiator() == CecLogicalAddress::Tv && cmd.parameters() == [0, 0] => {
           state.lock().unwrap().tv = Some(true);
             println!("======== TV an ===========")
         },
-        CecOpcode::ReportAudioStatus if cmd.initiator == CecLogicalAddress::Audiosystem => {
+        CecOpcode::ReportAudioStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
             /*
 Used to indicate the current audio volume status of a device.
 N indicates audio playback volume, expressed as a percentage
@@ -306,21 +384,21 @@ The linearity of the sound level is device dependent.
 This value is mainly used for displaying a volume status bar on
 a TV screen.
 */
-                let v = cmd.parameters.0[0];
+                let v = cmd.parameters()[0];
                 println!("Muted: {}", v & 0x80);
                 println!("Vol: {}%", v & 0x7f);
         },
-        CecOpcode::VendorCommandWithId if cmd.parameters == slice_to_arr(&[8, 0,70,0,19, 0, 16, 0, 0, 2, 0, 0, 0, 0]) => {
+        CecOpcode::VendorCommandWithId if cmd.parameters() == [8, 0,70,0,19, 0, 16, 0, 0, 2, 0, 0, 0, 0] => {
           println!("≈========tv realy on=========");
         },
         CecOpcode::SetSystemAudioMode => {
           let mut s = state.lock().unwrap();
-          s.audio_mode = cmd.parameters.0.get(0).map(|&b|b==1);
+          s.audio_mode = cmd.parameters().first().map(|&b|b==1);
           s.avr_standby = Some(false);
         },
-        CecOpcode::ReportPowerStatus if cmd.initiator == CecLogicalAddress::Audiosystem => {
+        CecOpcode::ReportPowerStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
           state.lock().unwrap().avr_standby =
-            match cmd.parameters.0.get(0) {
+            match cmd.parameters().first() {
                 Some(1) /*| Some(3)*/ => {
                     //standby
                     println!("Updated AVR PWR: Some(true) -> standby");
@@ -337,15 +415,15 @@ a TV screen.
                 }
             };
         },
-        CecOpcode::ReportPhysicalAddress if cmd.initiator == CecLogicalAddress::Audiosystem && cmd.parameters == slice_to_arr(&[0x30, 0, 5]) => {
+        CecOpcode::ReportPhysicalAddr if cmd.initiator() == CecLogicalAddress::Audiosystem && cmd.parameters() == [0x30, 0, 5] => {
             //audio became ready to receive commands
             state.lock().unwrap().avr_ready = true;
         },
-        CecOpcode::GiveDevicePowerStatus if cmd.initiator == CecLogicalAddress::Tv && cmd.destination == CecLogicalAddress::Playbackdevice2 => {
+        CecOpcode::GiveDevicePowerStatus if cmd.initiator() == CecLogicalAddress::Tv && cmd.destination() == CecLogicalAddress::Playback2 => {
            //libCEC answers on its own
         },
         _=>{
-                println!("<6>cec cmd: {:?} -> {:?}   {:?}: {:?}",cmd.initiator, cmd.destination, cmd.opcode, cmd.parameters);
+                println!("<6>cec cmd: {:?} -> {:?}   {:?}: {:x?}",cmd.initiator(), cmd.destination(), opcode, cmd.parameters());
            }
     }
 }
@@ -355,7 +433,9 @@ fn pulse_callback(res: ListResult<&SinkInputInfo> ) {
     match res {                
         ListResult::Item(item) => {
             if !item.corked {
-                unsafe {PULSE_SINKS += 1;}/*
+                unsafe {PULSE_SINKS += 1;}
+                println!("<6>pulse: {:?}", item.proplist);
+                /*
                 println!("<6>pulse: {:?} {:?}%", item.proplist, item.volume.get().get(0).map(|v|100*v.0/0xFFFF));
                 if let Some(v) = item.volume.get().get(0) {
                    unsafe{PULSE_VOLUME = (100 * (v.0 as u32)  / 0xFFFF) as u8;}
@@ -375,32 +455,8 @@ SinkInputInfo { index: 61, name: Some("Playback"), owner_module: Some(11), clien
 }
 
 
-fn log(msg: CecLogMessage) {
-/*
-Dec 15 22:24:30 livax cecremote[3077436]: Debug:<< Playback 2 (8) -> TV (0): on
-Dec 15 22:24:30 livax cecremote[3077436]: Traffic:<< 80:90:00
-Dec 15 22:24:30 livax cecremote[3077436]: Debug:>> TV (0) -> Playback 2 (8): give device power status (8F)
-Dec 15 22:25:30 livax cecremote[3077436]: Traffic:>> 08:8f
-*/
-    match msg.level {
-        cec_rs::CecLogLevel::Traffic => {return;},
-        cec_rs::CecLogLevel::Debug => {
-         if msg.message.ends_with("give device power status (8F)")
-         || msg.message.ends_with("Playback 2 (8) -> TV (0): on") {return;}
-        },
-        _ => {},
-    }
-    println!("<7>{}:{}", msg.level, msg.message);
-}
-fn key(key: CecKeypress) {
- println!("key {:?} {:?}", key.keycode, key.duration);
-}
-fn slice_to_arr(d: &[u8]) -> CecDatapacket {
- CecDatapacket(d.try_into().expect("data bigger than 64 bytes"))
-}
-
 /// requests audio focus. Turn on AVR if needed
-fn cec_audio_mode(cec: &CecConnection) {
+fn cec_audio_mode(cec: &CecDevice, from: CecLogicalAddress) {
     /*
     #The feature can be initiated from a device (eg TV or STB) or the amplifier. In the case of initiation by a device
     #other than the amplifier, that device sends an <System Audio Mode Request> to the amplifier, with the
@@ -412,17 +468,7 @@ It then sends a <Set System Audio Mode> [On] message.
 
 ...  the device requesting this information can send the volume-related <User Control Pressed> or <User Control Released> messages.
 */
-    let ccmd = CecCommand {
-        initiator: CecLogicalAddress::Playbackdevice2,
-        destination: CecLogicalAddress::Audiosystem,
-        ack: false,
-        eom: true,
-        opcode: CecOpcode::SystemAudioModeRequest,
-        parameters: slice_to_arr(b"\x33\x00"),
-        opcode_set: true,
-        transmit_timeout: Duration::from_millis(500),
-    };
-    print_err(cec.transmit(ccmd),"SystemAudioModeRequest failed");
+    print_err(cec.transmit_data(from, CecLogicalAddress::Audiosystem, CecOpcode::SystemAudioModeRequest, b"\x33\x00"),"SystemAudioModeRequest failed");
     //print_err(cec.audio_get_status(),"GiveAudioStatus");
 }
 ///Print an error
@@ -433,22 +479,12 @@ fn print_err<E: std::fmt::Debug>(res: Result<(),E>, name: &str)
     }
 }
 ///requests termination of audio focus
-fn cec_audio_mode_off(cec: &CecConnection) {
+fn cec_audio_mode_off(cec: &CecDevice, from: CecLogicalAddress) {
 /*
 <System Audio Mode Request> sent without a [Physical Address] parameter requests termination of the feature.
 In this case, the amplifier sends a <Set System Audio Mode> [Off] message.
     */
-    let ccmd = CecCommand {
-        initiator: CecLogicalAddress::Playbackdevice2,
-        destination: CecLogicalAddress::Audiosystem,
-        ack: false,
-        eom: true,
-        opcode: CecOpcode::SystemAudioModeRequest,
-        parameters: slice_to_arr(b""),
-        opcode_set: true,
-        transmit_timeout: Duration::from_millis(500),
-    };
-    print_err(cec.transmit(ccmd),"SystemAudioModeRequest off");
+    print_err(cec.transmit(from, CecLogicalAddress::Audiosystem, CecOpcode::SystemAudioModeRequest),"SystemAudioModeRequest off");
 }
 /*
 fn sync_volume(cec: &CecConnection, pwr: &GlobalSiSPM) {
