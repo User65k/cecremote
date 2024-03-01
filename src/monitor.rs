@@ -1,6 +1,6 @@
 use crate::GState;
 use cec_linux::{
-    CecDevice, CecEvent, CecLogAddrMask, CecLogicalAddress, CecMsg, CecOpcode, PollFlags,
+    CecDevice, CecEvent, CecLogAddrMask, CecLogicalAddress, CecMsg, CecOpcode, CecPowerStatus, PollFlags
 };
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -62,7 +62,7 @@ fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
             state.lock().unwrap().tv = Some(false);
             println!("======== Tv aus ===========")
         }
-        CecOpcode::ActiveSource
+        CecOpcode::ActiveSource if cmd.initiator() != CecLogicalAddress::Playback2
             //if cmd.initiator() == CecLogicalAddress::Tv && cmd.parameters() == [0, 0]
             =>
         {
@@ -74,39 +74,26 @@ fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
                 s.active_source = 0xffff;
             }
             println!("======== {:x} an ===========", s.active_source);
-        }
-        /*CecOpcode::ReportAudioStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
-            /*
-            Used to indicate the current audio volume status of a device.
-            N indicates audio playback volume, expressed as a percentage
-            (0% - 100%). N=0 is no sound; N=100 is maximum volume
-            sound level.
-            The linearity of the sound level is device dependent.
-            This value is mainly used for displaying a volume status bar on
-            a TV screen.
-            */
-            let v = cmd.parameters()[0];
-            println!("Muted: {}", v & 0x80);
-            println!("Vol: {}%", v & 0x7f);
-        }*/
+        }/*
         CecOpcode::VendorCommandWithId
-            if cmd.parameters() == [8, 0, 70, 0, 19, 0, 16, 0, 0, 2, 0, 0, 0, 0] =>
+            if cmd.parameters()[0..3] == [8, 0, 70] =>
         {
+            //, 0, 19, 0, 16, 0, 0, 2, 0, 0, 0, 0
             println!("≈========tv realy on=========");
-        }
+        }*/
         CecOpcode::SetSystemAudioMode => {
             let mut s = state.lock().unwrap();
-            s.audio_mode = cmd.parameters().first().map(|&b| b == 1);
+            //s.audio_mode = cmd.parameters().first().map(|&b| b == 1);
             s.avr_standby = Some(false);
         }
         CecOpcode::ReportPowerStatus if cmd.initiator() == CecLogicalAddress::Audiosystem => {
-            state.lock().unwrap().avr_standby = match cmd.parameters().first() {
-                Some(1) /*| Some(3)*/ => {
+            state.lock().unwrap().avr_standby = match cmd.parameters().first().and_then(|&i|CecPowerStatus::try_from(i).ok()) {
+                Some(CecPowerStatus::Standby) /*| Some(3)*/ => {
                     //standby
                     println!("Updated AVR PWR: Some(true) -> standby");
                     Some(true)
                 },
-                Some(0) /*| Some(2)*/ => {
+                Some(CecPowerStatus::On) /*| Some(2)*/ => {
                     //on
                     println!("Updated AVR PWR: Some(false) -> on");
                     Some(false)
@@ -133,6 +120,7 @@ fn command(cmd: CecMsg, state: &mut Arc<Mutex<GState>>) {
         CecOpcode::UserControlPressed | CecOpcode::UserControlReleased
             if cmd.initiator() == CecLogicalAddress::Playback2 => {}
         CecOpcode::FeatureAbort if cmd.initiator() == CecLogicalAddress::Playback2 => {}//vendor id
+        CecOpcode::ReportPhysicalAddr | CecOpcode::DeviceVendorId | CecOpcode::GiveDeviceVendorId => {}
         _ => {
             println!(
                 "<7>cec cmd: {:?} -> {:?}   {:?}: {:x?}",
