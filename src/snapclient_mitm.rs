@@ -1,7 +1,7 @@
 use crate::Actor;
 use std::convert::TryInto;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Weak;
@@ -69,6 +69,7 @@ fn fwd(
     snapclient_vol_changed: &Weak<AtomicBool>,
 ) -> Result<(), std::io::Error> {
     let server = TcpStream::connect("127.0.0.1:1704")?;
+    println!("started snapcast mitm");
 
     let mut s = server.try_clone()?;
     let mut c = client.try_clone()?;
@@ -95,14 +96,33 @@ fn fwd(
     while let Ok(r) = c.read(&mut buffer) {
         if r == 0 {
             println!("<5>c2s done");
+            s.shutdown(Shutdown::Write)?;
             return Ok(());
         }
         if let Err(e) = s.write_all(&buffer[..r]) {
             println!("<3>c2s error: {}", e);
+            c.shutdown(Shutdown::Read)?;
             return Err(e);
         }
     }
     Ok(())
+}
+
+fn server_read(server: &mut TcpStream, buf: &mut [u8]) -> Result<(u16, usize), std::io::Error> {
+    server.read_exact(&mut buf[..26])?;
+
+    let typ = u16::from_le_bytes(buf[..2].try_into().unwrap());
+    let size = u32::from_le_bytes(buf[22..26].try_into().unwrap()) as usize;
+
+    if size + 26 > buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("huge packet {}", size + 26),
+        ));
+    }
+
+    server.read_exact(&mut buf[26..size + 26])?;
+    Ok((typ, size))
 }
 
 fn server_to_client(
@@ -117,16 +137,13 @@ fn server_to_client(
     loop {
         let mut buf = [0u8; 1024 * 17];
         //forward client -> server
-        server.read_exact(&mut buf[..26])?;
-
-        let typ = u16::from_le_bytes(buf[..2].try_into().unwrap());
-        let size = u32::from_le_bytes(buf[22..26].try_into().unwrap()) as usize;
-
-        if size + 26 > buf.len() {
-            panic!("huge packet {}", size + 26);
-        }
-
-        server.read_exact(&mut buf[26..size + 26])?;
+        let (typ, size) = match server_read(&mut server, &mut buf) {
+            Ok(r) => r,
+            Err(e) => {
+                client.shutdown(Shutdown::Write)?;
+                return Err(e);
+            }
+        };
 
         match typ {
             3 => {
@@ -190,7 +207,10 @@ fn server_to_client(
             }
         }
 
-        client.write_all(&buf[..size + 26])?;
+        if let Err(e) = client.write_all(&buf[..size + 26]) {
+            server.shutdown(Shutdown::Read)?;
+            return Err(e);
+        }
     }
 }
 
