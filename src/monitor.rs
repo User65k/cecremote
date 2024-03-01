@@ -1,6 +1,6 @@
 use crate::GState;
 use cec_linux::{
-    CecDevice, CecEvent, CecLogAddrMask, CecLogicalAddress, CecMsg, CecOpcode, CecPowerStatus, PollFlags
+    CecDevice, CecEvent, CecLogAddrMask, CecLogicalAddress, CecMsg, CecOpcode, CecPhysicalAddress, CecPowerStatus, PollFlags, PollTimeout
 };
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -10,12 +10,17 @@ pub fn mon(cec_mon: CecDevice, mut mutex: Arc<Mutex<GState>>) {
         let f = cec_mon
             .poll(
                 PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLPRI,
-                -1,
+                PollTimeout::NONE,
             )
             .unwrap();
         if f.intersects(PollFlags::POLLPRI) {
             if let CecEvent::StateChange(s) = cec_mon.get_event().unwrap() {
-                println!("<7>{:?}", s);
+                if s.phys_addr == CecPhysicalAddress::INVALID {
+                    println!("<7> CEC disconnected");
+                } else if !s.log_addr_mask.is_empty() {
+                    println!("<7> CEC connected {:?} {:?}", s.phys_addr, s.log_addr_mask);
+                    //sometimes phys addr is 0x3000 instead of 0x3300
+                }
                 let on = if s.log_addr_mask.contains(CecLogAddrMask::Playback1) {
                     mutex.lock().unwrap().cec_addr = Some(CecLogicalAddress::Playback1);
                     true
